@@ -1,0 +1,699 @@
+# .NET Code Review Checklist
+
+> **Last updated:** 2026-04-02
+
+A practical checklist for reviewing .NET / C# codebases. Each rule includes severity, grep patterns for scanning, and bad/good code examples.
+
+---
+
+## Table of Contents
+
+1. [Dispose All Streams (IDisposable)](#1-dispose-all-streams-idisposable)
+2. [HttpClient Must Be Singleton or Static](#2-httpclient-must-be-singleton-or-static)
+3. [Async/Await — No .Result or .Wait()](#3-asyncawait--no-result-or-wait)
+4. [SerialPort Must Set ReadTimeout and WriteTimeout](#4-serialport-must-set-readtimeout-and-writetimeout)
+5. [Use SqlParameter — No String Concatenation](#5-use-sqlparameter--no-string-concatenation)
+6. [Dispose SqlConnection, SqlCommand, SqlDataReader, SqlTransaction](#6-dispose-sqlconnection-sqlcommand-sqldatareader-sqltransaction)
+7. [Follow Microsoft C# Code Conventions](#7-follow-microsoft-c-code-conventions)
+8. [Visual Studio .gitignore](#8-visual-studio-gitignore)
+9. [Singleton + Lazy Pattern for Redis, CosmosDB, Service Bus](#9-singleton--lazy-pattern-for-redis-cosmosdb-service-bus)
+10. [Use Serilog Instead of Custom Logging](#10-use-serilog-instead-of-custom-logging)
+11. [Beware of Static Collections (Memory Leak Risk)](#11-beware-of-static-collections-memory-leak-risk)
+
+---
+
+## 1. Dispose All Streams (IDisposable)
+
+| Severity | Category | Search Pattern |
+|----------|----------|----------------|
+| **High** | Resource Management | `new FileStream`, `new MemoryStream`, `new StreamReader`, `new StreamWriter`, `new NetworkStream`, `new BufferedStream` |
+
+**Why it matters:** Streams hold unmanaged resources (file handles, sockets). Failing to dispose them causes file locks, handle exhaustion, and memory pressure in long-running services.
+
+### Bad Example
+
+```csharp
+public byte[] ReadFile(string path)
+{
+    var stream = new FileStream(path, FileMode.Open);
+    var reader = new StreamReader(stream);
+    var content = reader.ReadToEnd();
+    return Encoding.UTF8.GetBytes(content);
+    // stream and reader are never disposed — file handle leaked
+}
+```
+
+### Good Example
+
+```csharp
+public byte[] ReadFile(string path)
+{
+    using var stream = new FileStream(path, FileMode.Open);
+    using var reader = new StreamReader(stream);
+    var content = reader.ReadToEnd();
+    return Encoding.UTF8.GetBytes(content);
+}
+```
+
+**Reviewer tip:** Look for any `new *Stream*` or `new StreamReader/Writer` that is **not** preceded by `using`.
+
+---
+
+## 2. HttpClient Must Be Singleton or Static
+
+| Severity | Category | Search Pattern |
+|----------|----------|----------------|
+| **High** | Resource Management / Networking | `new HttpClient()`, `new HttpClient(` |
+
+**Why it matters:** Each `HttpClient` instance opens its own connection pool. Creating and disposing them per request leads to **socket exhaustion** (`TIME_WAIT` state) and can bring down the application under load.
+
+### Bad Example
+
+```csharp
+public async Task<string> GetDataAsync(string url)
+{
+    using var client = new HttpClient(); // new instance per call — socket exhaustion
+    var response = await client.GetAsync(url);
+    return await response.Content.ReadAsStringAsync();
+}
+```
+
+### Good Example — Static Instance
+
+```csharp
+public class ApiService
+{
+    private static readonly HttpClient _httpClient = new HttpClient();
+
+    public async Task<string> GetDataAsync(string url)
+    {
+        var response = await _httpClient.GetAsync(url);
+        return await response.Content.ReadAsStringAsync();
+    }
+}
+```
+
+### Good Example — IHttpClientFactory (Recommended for DI)
+
+```csharp
+// In Startup / Program.cs
+builder.Services.AddHttpClient();
+
+// In your service
+public class ApiService
+{
+    private readonly IHttpClientFactory _httpClientFactory;
+
+    public ApiService(IHttpClientFactory httpClientFactory)
+    {
+        _httpClientFactory = httpClientFactory;
+    }
+
+    public async Task<string> GetDataAsync(string url)
+    {
+        var client = _httpClientFactory.CreateClient();
+        var response = await client.GetAsync(url);
+        return await response.Content.ReadAsStringAsync();
+    }
+}
+```
+
+**Reviewer tip:** Search for `new HttpClient()`. It should appear **at most once** as a static/singleton field, or not at all if `IHttpClientFactory` is used.
+
+---
+
+## 3. Async/Await — No .Result or .Wait()
+
+| Severity | Category | Search Pattern |
+|----------|----------|----------------|
+| **Critical** | Concurrency | `.Result`, `.Wait()`, `.GetAwaiter().GetResult()` |
+
+**Why it matters:** Calling `.Result` or `.Wait()` on a `Task` **blocks the calling thread** and can cause a **deadlock** in environments with a synchronization context (ASP.NET, WinForms, WPF). The blocked thread holds the sync context, while the awaited task needs it to complete — resulting in a permanent hang.
+
+### Bad Example
+
+```csharp
+public string GetData()
+{
+    // DEADLOCK: blocks the thread while waiting for the async result
+    var result = GetDataAsync().Result;
+    return result;
+}
+
+public void SendNotification()
+{
+    // DEADLOCK: same issue with .Wait()
+    SendNotificationAsync().Wait();
+}
+```
+
+### Good Example
+
+```csharp
+public async Task<string> GetDataAsync()
+{
+    var result = await _httpClient.GetStringAsync("https://api.example.com/data");
+    return result;
+}
+
+public async Task SendNotificationAsync()
+{
+    await _notificationService.SendAsync(message);
+}
+```
+
+> **Note:** If you absolutely must call async from sync code (e.g., `Main` in legacy console apps), use `GetAwaiter().GetResult()` as a last resort — but document why. The proper fix is to make the entire call chain `async`.
+
+**Reviewer tip:** Search for `.Result`, `.Wait()`, and `.GetAwaiter().GetResult()`. Each occurrence needs justification or refactoring to `await`.
+
+---
+
+## 4. SerialPort Must Set ReadTimeout and WriteTimeout
+
+| Severity | Category | Search Pattern |
+|----------|----------|----------------|
+| **Medium** | Hardware / IO | `new SerialPort`, `SerialPort` |
+
+**Why it matters:** The default timeout for `SerialPort` is `InfiniteTimeout` (-1). If the connected device does not respond, `Read` or `Write` will **block the thread forever**, freezing the application.
+
+### Bad Example
+
+```csharp
+var port = new SerialPort("COM3", 9600);
+port.Open();
+string data = port.ReadLine(); // blocks forever if device does not respond
+```
+
+### Good Example
+
+```csharp
+var port = new SerialPort("COM3", 9600)
+{
+    ReadTimeout = 3000,  // 3 seconds
+    WriteTimeout = 3000  // 3 seconds
+};
+
+port.Open();
+
+try
+{
+    string data = port.ReadLine();
+}
+catch (TimeoutException)
+{
+    // handle timeout — log, retry, or alert
+}
+finally
+{
+    port.Close();
+}
+```
+
+**Reviewer tip:** Every `new SerialPort` should have `ReadTimeout` and `WriteTimeout` set before or immediately after opening.
+
+---
+
+## 5. Use SqlParameter — No String Concatenation
+
+| Severity | Category | Search Pattern |
+|----------|----------|----------------|
+| **Critical** | Security (SQL Injection) | `"SELECT " +`, `"INSERT " +`, `"UPDATE " +`, `"DELETE " +`, `$"SELECT`, `$"INSERT`, `$"UPDATE`, `$"DELETE`, `string.Format("SELECT` |
+
+**Why it matters:** String concatenation in SQL queries enables **SQL injection** — an attacker can manipulate input to execute arbitrary SQL, potentially compromising the entire database. This is [OWASP Top 10 #3 (Injection)](https://owasp.org/Top10/).
+
+### Bad Example
+
+```csharp
+public User GetUser(string userId)
+{
+    using var connection = new SqlConnection(connectionString);
+    using var command = new SqlCommand();
+    command.Connection = connection;
+
+    // SQL INJECTION: user input directly concatenated
+    command.CommandText = "SELECT * FROM Users WHERE Id = '" + userId + "'";
+
+    connection.Open();
+    using var reader = command.ExecuteReader();
+    // ...
+}
+```
+
+### Good Example — SqlParameter
+
+```csharp
+public User GetUser(string userId)
+{
+    using var connection = new SqlConnection(connectionString);
+    using var command = new SqlCommand("SELECT * FROM Users WHERE Id = @Id", connection);
+    command.Parameters.Add(new SqlParameter("@Id", SqlDbType.NVarChar) { Value = userId });
+
+    connection.Open();
+    using var reader = command.ExecuteReader();
+    // ...
+}
+```
+
+### Good Example — Dapper (Parameterized)
+
+```csharp
+public User GetUser(string userId)
+{
+    using var connection = new SqlConnection(connectionString);
+    return connection.QueryFirstOrDefault<User>(
+        "SELECT * FROM Users WHERE Id = @Id",
+        new { Id = userId });
+}
+```
+
+**Reviewer tip:** Search for string concatenation or interpolation near SQL keywords (`SELECT`, `INSERT`, `UPDATE`, `DELETE`). Every query parameter must use `SqlParameter` or an ORM's parameterized API.
+
+---
+
+## 6. Dispose SqlConnection, SqlCommand, SqlDataReader, SqlTransaction
+
+| Severity | Category | Search Pattern |
+|----------|----------|----------------|
+| **High** | Resource Management / Database | `new SqlConnection`, `new SqlCommand`, `ExecuteReader`, `BeginTransaction` |
+
+**Why it matters:** Undisposed `SqlConnection` objects are **not returned to the connection pool**, leading to **connection pool exhaustion**. Undisposed `SqlTransaction` objects can hold database locks indefinitely.
+
+### Bad Example
+
+```csharp
+public List<Order> GetOrders()
+{
+    var connection = new SqlConnection(connectionString);
+    var command = new SqlCommand("SELECT * FROM Orders", connection);
+
+    connection.Open();
+    var reader = command.ExecuteReader();
+
+    var orders = new List<Order>();
+    while (reader.Read())
+    {
+        orders.Add(MapOrder(reader));
+    }
+
+    // connection, command, and reader are never disposed
+    // connection is NOT returned to the pool
+    return orders;
+}
+```
+
+### Good Example
+
+```csharp
+public List<Order> GetOrders()
+{
+    using var connection = new SqlConnection(connectionString);
+    using var command = new SqlCommand("SELECT * FROM Orders", connection);
+
+    connection.Open();
+    using var reader = command.ExecuteReader();
+
+    var orders = new List<Order>();
+    while (reader.Read())
+    {
+        orders.Add(MapOrder(reader));
+    }
+
+    return orders;
+}
+```
+
+### Good Example — With Transaction
+
+```csharp
+public void TransferFunds(int fromId, int toId, decimal amount)
+{
+    using var connection = new SqlConnection(connectionString);
+    connection.Open();
+
+    using var transaction = connection.BeginTransaction();
+    try
+    {
+        using var debitCmd = new SqlCommand(
+            "UPDATE Accounts SET Balance = Balance - @Amount WHERE Id = @Id", connection, transaction);
+        debitCmd.Parameters.AddWithValue("@Amount", amount);
+        debitCmd.Parameters.AddWithValue("@Id", fromId);
+        debitCmd.ExecuteNonQuery();
+
+        using var creditCmd = new SqlCommand(
+            "UPDATE Accounts SET Balance = Balance + @Amount WHERE Id = @Id", connection, transaction);
+        creditCmd.Parameters.AddWithValue("@Amount", amount);
+        creditCmd.Parameters.AddWithValue("@Id", toId);
+        creditCmd.ExecuteNonQuery();
+
+        transaction.Commit();
+    }
+    catch
+    {
+        transaction.Rollback();
+        throw;
+    }
+}
+```
+
+**Reviewer tip:** Every `new SqlConnection`, `new SqlCommand`, `ExecuteReader()`, and `BeginTransaction()` must be wrapped in a `using` statement.
+
+---
+
+## 7. Follow Microsoft C# Code Conventions
+
+| Severity | Category | Search Pattern |
+|----------|----------|----------------|
+| **Medium** | Code Style | N/A — use tooling |
+
+**Why it matters:** Consistent code style reduces cognitive load during reviews and makes the codebase easier to maintain. Automated enforcement prevents style debates in PRs.
+
+### Key Conventions
+
+| Element | Convention | Example |
+|---------|-----------|---------|
+| Public members | PascalCase | `public void ProcessOrder()` |
+| Private fields | `_camelCase` with underscore prefix | `private readonly int _retryCount;` |
+| Local variables | camelCase | `var orderCount = 0;` |
+| Constants | PascalCase | `public const int MaxRetries = 3;` |
+| Interfaces | `I` prefix + PascalCase | `public interface IOrderService` |
+| Braces | New line (Allman style) | See below |
+| `var` usage | Use when type is apparent | `var orders = new List<Order>();` |
+| File-scoped namespaces | Prefer in C# 10+ | `namespace MyApp.Services;` |
+
+### Enforce with .editorconfig
+
+Add an `.editorconfig` to the repo root to enforce conventions automatically:
+
+```ini
+[*.cs]
+# Naming
+dotnet_naming_rule.private_fields_should_be_camel_case.severity = warning
+dotnet_naming_rule.private_fields_should_be_camel_case.symbols = private_fields
+dotnet_naming_rule.private_fields_should_be_camel_case.style = camel_case_underscore
+
+dotnet_naming_symbols.private_fields.applicable_kinds = field
+dotnet_naming_symbols.private_fields.applicable_accessibilities = private
+
+dotnet_naming_style.camel_case_underscore.required_prefix = _
+dotnet_naming_style.camel_case_underscore.capitalization = camel_case
+
+# Formatting
+csharp_new_line_before_open_brace = all
+csharp_prefer_braces = true:warning
+csharp_style_namespace_declarations = file_scoped:suggestion
+
+# var preferences
+csharp_style_var_when_type_is_apparent = true:suggestion
+```
+
+Run `dotnet format` to auto-fix style violations before committing.
+
+**Reviewer tip:** Ensure the project has an `.editorconfig`. Run `dotnet format --verify-no-changes` in CI to catch violations automatically.
+
+> **Reference:** [Microsoft C# Coding Conventions](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/coding-style/coding-conventions)
+
+---
+
+## 8. Visual Studio .gitignore
+
+| Severity | Category | Search Pattern |
+|----------|----------|----------------|
+| **N/A** | Configuration | Check for `.gitignore` in repo root |
+
+**Status: Done** — This repository already includes the standard [VisualStudio.gitignore](https://github.com/github/gitignore/blob/main/VisualStudio.gitignore) template.
+
+Every .NET repository should start with this template to avoid committing:
+- Build outputs (`bin/`, `obj/`)
+- User-specific files (`.suo`, `.user`, `.vs/`)
+- NuGet packages
+- Test results and logs
+
+**Reviewer tip:** If a new repo is missing a `.gitignore`, copy the standard template from GitHub's [gitignore repository](https://github.com/github/gitignore/blob/main/VisualStudio.gitignore).
+
+---
+
+## 9. Singleton + Lazy Pattern for Redis, CosmosDB, Service Bus
+
+| Severity | Category | Search Pattern |
+|----------|----------|----------------|
+| **High** | Resource Management / Connectivity | `ConnectionMultiplexer.Connect`, `new ConnectionMultiplexer`, `new CosmosClient`, `new ServiceBusClient`, `new ServiceBusSender` |
+
+**Why it matters:** These clients manage their own connection pools internally and are designed to be **long-lived singletons**. Creating new instances per request causes connection storms, exceeds connection limits, and degrades performance. `Lazy<T>` ensures **thread-safe, one-time initialization**.
+
+### Bad Example — Redis
+
+```csharp
+public class CacheService
+{
+    public string GetValue(string key)
+    {
+        // new connection per call — connection storm, exhausts server connections
+        var redis = ConnectionMultiplexer.Connect("localhost:6379");
+        var db = redis.GetDatabase();
+        return db.StringGet(key);
+    }
+}
+```
+
+### Good Example — Redis with Lazy Singleton
+
+```csharp
+public class CacheService
+{
+    private static readonly Lazy<ConnectionMultiplexer> _lazyConnection =
+        new Lazy<ConnectionMultiplexer>(() =>
+            ConnectionMultiplexer.Connect("localhost:6379"));
+
+    public static ConnectionMultiplexer Connection => _lazyConnection.Value;
+
+    public string GetValue(string key)
+    {
+        var db = Connection.GetDatabase();
+        return db.StringGet(key);
+    }
+}
+```
+
+### Good Example — DI Registration (CosmosDB / Service Bus)
+
+```csharp
+// Program.cs — register as singleton
+builder.Services.AddSingleton(_ => new CosmosClient(connectionString));
+builder.Services.AddSingleton(_ => new ServiceBusClient(connectionString));
+
+// In your service — inject via constructor
+public class OrderRepository
+{
+    private readonly CosmosClient _cosmosClient;
+
+    public OrderRepository(CosmosClient cosmosClient)
+    {
+        _cosmosClient = cosmosClient;
+    }
+}
+```
+
+> **Same pattern applies to:** `CosmosClient`, `ServiceBusClient`, `ServiceBusSender`, `ServiceBusProcessor`, and similar long-lived connection-based clients.
+
+**Reviewer tip:** Search for `ConnectionMultiplexer.Connect`, `new CosmosClient`, `new ServiceBusClient`. They should appear only in a singleton registration or `Lazy<T>` initializer — never inside a method called per request.
+
+---
+
+## 10. Use Serilog Instead of Custom Logging
+
+| Severity | Category | Search Pattern |
+|----------|----------|----------------|
+| **Medium** | Observability | `Console.WriteLine` (as logging), custom `Logger` or `LogHelper` classes, `Trace.Write`, `File.AppendAllText` (for logging) |
+
+**Why it matters:** Hand-rolled logging is error-prone, lacks structured data, and doesn't integrate with modern observability platforms. **Serilog** provides structured logging, a rich sink ecosystem (Seq, Elasticsearch, Application Insights, File), and high performance out of the box.
+
+### Bad Example — Custom Logging
+
+```csharp
+public class OrderService
+{
+    public void ProcessOrder(int orderId)
+    {
+        File.AppendAllText("logs.txt",
+            $"{DateTime.Now} - Processing order {orderId}\n"); // no structure, no levels, poor performance
+
+        try
+        {
+            // ... process order
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error: {ex.Message}"); // lost on restart, not searchable
+        }
+    }
+}
+```
+
+### Good Example — Serilog
+
+```csharp
+// Program.cs — setup
+Log.Logger = new LoggerConfiguration()
+    .MinimumLevel.Information()
+    .WriteTo.Console()
+    .WriteTo.File("logs/app-.log", rollingInterval: RollingInterval.Day)
+    .CreateLogger();
+
+builder.Host.UseSerilog();
+```
+
+```csharp
+// In your service — use structured logging
+public class OrderService
+{
+    private readonly ILogger<OrderService> _logger;
+
+    public OrderService(ILogger<OrderService> logger)
+    {
+        _logger = logger;
+    }
+
+    public void ProcessOrder(int orderId)
+    {
+        _logger.LogInformation("Processing order {OrderId}", orderId); // structured, searchable
+
+        try
+        {
+            // ... process order
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to process order {OrderId}", orderId);
+        }
+    }
+}
+```
+
+> **Key benefit:** Message templates like `"Processing order {OrderId}"` produce **structured log events** where `OrderId` is a searchable, filterable property — not just embedded text.
+
+**Reviewer tip:** Search for `Console.WriteLine`, `File.AppendAllText`, or custom `Logger`/`LogHelper` classes used for logging. These should be replaced with `ILogger<T>` backed by Serilog.
+
+---
+
+## 11. Beware of Static Collections (Memory Leak Risk)
+
+| Severity | Category | Search Pattern |
+|----------|----------|----------------|
+| **High** | Memory Management | `static List<`, `static Dictionary<`, `static ArrayList`, `static IEnumerable`, `static ConcurrentDictionary<`, `static HashSet<`, `static IList<`, `static IDictionary<` |
+
+**Why it matters:** Static variables live for the **entire lifetime of the process**. A static collection that grows (items added but never removed) causes a **memory leak** that eventually leads to `OutOfMemoryException`. This is especially dangerous in ASP.NET applications that run for days or weeks.
+
+### Bad Example
+
+```csharp
+public class SessionTracker
+{
+    // grows forever — never cleaned up
+    private static readonly List<UserSession> _sessions = new List<UserSession>();
+
+    public void TrackSession(UserSession session)
+    {
+        _sessions.Add(session); // items are added but never removed
+    }
+}
+```
+
+```csharp
+public class DataCache
+{
+    // unbounded dictionary — every unique key stays forever
+    private static readonly Dictionary<string, object> _cache = new Dictionary<string, object>();
+
+    public void Set(string key, object value)
+    {
+        _cache[key] = value; // entries are never evicted
+    }
+}
+```
+
+### Good Example — Use IMemoryCache with Expiration
+
+```csharp
+// Program.cs
+builder.Services.AddMemoryCache();
+
+// In your service
+public class DataCache
+{
+    private readonly IMemoryCache _cache;
+
+    public DataCache(IMemoryCache cache)
+    {
+        _cache = cache;
+    }
+
+    public void Set(string key, object value)
+    {
+        var options = new MemoryCacheEntryOptions
+        {
+            AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(30),
+            SlidingExpiration = TimeSpan.FromMinutes(10)
+        };
+
+        _cache.Set(key, value, options);
+    }
+}
+```
+
+### Good Example — Bounded Collection with Cleanup
+
+```csharp
+public class SessionTracker
+{
+    private static readonly ConcurrentDictionary<string, UserSession> _sessions = new();
+    private static readonly Timer _cleanupTimer = new Timer(CleanupExpired, null,
+        TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
+
+    public void TrackSession(UserSession session)
+    {
+        _sessions[session.Id] = session;
+    }
+
+    private static void CleanupExpired(object state)
+    {
+        var expired = _sessions.Where(s => s.Value.ExpiresAt < DateTime.UtcNow).ToList();
+        foreach (var session in expired)
+        {
+            _sessions.TryRemove(session.Key, out _);
+        }
+    }
+}
+```
+
+**Reviewer tip:** Search for `static List<`, `static Dictionary<`, `static ArrayList`, etc. For each hit, verify: (1) Is there a removal/eviction mechanism? (2) Is the growth bounded? If not, flag it.
+
+---
+
+## Quick-Scan Reference Table
+
+| # | Rule | Grep / Search Pattern | Severity |
+|---|------|-----------------------|----------|
+| 1 | Dispose streams | `new FileStream`, `new MemoryStream`, `new StreamReader`, `new StreamWriter` | High |
+| 2 | HttpClient singleton | `new HttpClient()` | High |
+| 3 | No .Result/.Wait() | `.Result`, `.Wait()`, `.GetAwaiter().GetResult()` | Critical |
+| 4 | SerialPort timeouts | `new SerialPort` | Medium |
+| 5 | SqlParameter required | `"SELECT " +`, `$"SELECT`, `"INSERT " +`, `"UPDATE " +`, `"DELETE " +` | Critical |
+| 6 | Dispose SQL objects | `new SqlConnection`, `new SqlCommand`, `ExecuteReader`, `BeginTransaction` | High |
+| 7 | C# code conventions | Use `.editorconfig` + `dotnet format` | Medium |
+| 8 | .gitignore | Check repo root for `.gitignore` | N/A |
+| 9 | Redis/Cosmos/SB singleton | `ConnectionMultiplexer.Connect`, `new CosmosClient`, `new ServiceBusClient` | High |
+| 10 | Use Serilog | `Console.WriteLine` (as log), custom `Logger` class | Medium |
+| 11 | Static collections | `static List<`, `static Dictionary<`, `static ArrayList` | High |
+
+---
+
+## References
+
+- [IDisposable Interface](https://learn.microsoft.com/en-us/dotnet/api/system.idisposable)
+- [HttpClient Guidelines](https://learn.microsoft.com/en-us/dotnet/fundamentals/networking/http/httpclient-guidelines)
+- [Async/Await Best Practices](https://learn.microsoft.com/en-us/archive/msdn-magazine/2013/march/async-await-best-practices-in-asynchronous-programming)
+- [SQL Injection Prevention](https://learn.microsoft.com/en-us/sql/relational-databases/security/sql-injection)
+- [C# Coding Conventions](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/coding-style/coding-conventions)
+- [Serilog](https://github.com/serilog/serilog)
+- [StackExchange.Redis — Basic Usage](https://stackexchange.github.io/StackExchange.Redis/Basics.html)
+- [VisualStudio.gitignore](https://github.com/github/gitignore/blob/main/VisualStudio.gitignore)
