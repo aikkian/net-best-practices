@@ -26,6 +26,8 @@ A practical checklist for reviewing .NET / C# codebases. Each rule includes seve
 16. [Avoid async void — Use async Task](#16-avoid-async-void--use-async-task)
 17. [Use throw; Not throw ex;](#17-use-throw-not-throw-ex)
 18. [Use Concurrent Collections for Shared State](#18-use-concurrent-collections-for-shared-state)
+19. [Avoid Task.Run() in ASP.NET Request Handlers](#19-avoid-taskrun-in-aspnet-request-handlers)
+20. [Avoid the dynamic Keyword](#20-avoid-the-dynamic-keyword)
 
 ---
 
@@ -1107,6 +1109,135 @@ public class UserCache
 
 ---
 
+## 19. Avoid Task.Run() in ASP.NET Request Handlers
+
+| Severity | Category | Search Pattern |
+|----------|----------|----------------|
+| **Medium** | Performance | `Task.Run(`, `Task.Factory.StartNew(` inside controllers or request handlers |
+
+**Why it matters:** ASP.NET already processes each request on a thread pool thread. Wrapping synchronous work in `Task.Run()` inside a request handler **borrows a second thread pool thread** to do the same work, adding overhead (context switch, scheduling) with zero benefit. Under load, this wastes thread pool threads and **reduces throughput**. `Task.Run()` is designed for offloading CPU-bound work from UI threads (WinForms/WPF), not for ASP.NET.
+
+### Bad Example
+
+```csharp
+[HttpGet("report")]
+public async Task<IActionResult> GetReport()
+{
+    // wasteful — moves work from one thread pool thread to another
+    var report = await Task.Run(() => GenerateReport());
+    return Ok(report);
+}
+
+private Report GenerateReport()
+{
+    // CPU-bound work
+    return new Report { Data = ComputeData() };
+}
+```
+
+### Good Example — Call Synchronous Code Directly
+
+```csharp
+[HttpGet("report")]
+public IActionResult GetReport()
+{
+    // no unnecessary thread switch — runs on the request thread directly
+    var report = GenerateReport();
+    return Ok(report);
+}
+```
+
+### Good Example — True Async for I/O
+
+```csharp
+[HttpGet("report")]
+public async Task<IActionResult> GetReport()
+{
+    // truly async I/O — thread is released while waiting
+    var data = await _repository.GetReportDataAsync();
+    return Ok(data);
+}
+```
+
+> **When Task.Run() IS appropriate:** In desktop apps (WinForms/WPF) to keep the UI thread responsive, or in background services where you explicitly want to parallelize CPU-bound work across multiple threads.
+
+**Reviewer tip:** Search for `Task.Run(` and `Task.Factory.StartNew(` inside ASP.NET controllers or middleware. If the wrapped code is synchronous, it should be called directly. If it's I/O, it should be made truly async.
+
+---
+
+## 20. Avoid the dynamic Keyword
+
+| Severity | Category | Search Pattern |
+|----------|----------|----------------|
+| **Medium** | Code Quality / Performance | `dynamic ` |
+
+**Why it matters:** The `dynamic` keyword bypasses **compile-time type checking**. Errors that would normally be caught at build time (typos in property names, wrong argument types, missing methods) only surface at **runtime** as `RuntimeBinderException`. It also incurs significant performance overhead due to runtime binding via the DLR (Dynamic Language Runtime) and makes code harder to refactor, navigate, and understand in an IDE.
+
+### Bad Example
+
+```csharp
+public void ProcessPayment(dynamic payment)
+{
+    // no compile-time safety — typo in property name won't be caught until runtime
+    decimal amount = payment.Ammount; // RuntimeBinderException at runtime — "Amount" misspelled
+    string method = payment.Method;
+
+    _gateway.Charge(amount, method);
+}
+```
+
+```csharp
+// dynamic used to avoid creating a proper type
+dynamic config = JsonConvert.DeserializeObject(json);
+string host = config.database.host; // no IntelliSense, no refactoring support
+int port = config.database.port;
+```
+
+### Good Example — Use Strong Types
+
+```csharp
+public class Payment
+{
+    public decimal Amount { get; set; }
+    public string Method { get; set; }
+}
+
+public void ProcessPayment(Payment payment)
+{
+    // compile-time safety — typos caught immediately
+    _gateway.Charge(payment.Amount, payment.Method);
+}
+```
+
+```csharp
+// Strongly-typed configuration
+public class DatabaseConfig
+{
+    public string Host { get; set; }
+    public int Port { get; set; }
+}
+
+var config = JsonConvert.DeserializeObject<DatabaseConfig>(json);
+string host = config.Host; // IntelliSense, compile-time checks, refactoring support
+```
+
+### Good Example — Use Generics Instead of dynamic
+
+```csharp
+// Instead of: dynamic result = GetValue();
+// Use generics:
+public T GetValue<T>(string key)
+{
+    return JsonSerializer.Deserialize<T>(cache.Get(key));
+}
+```
+
+> **When dynamic IS appropriate:** COM interop (e.g., Office automation), interacting with dynamic languages (IronPython), or rare reflection-heavy scenarios where the type is truly unknown at compile time.
+
+**Reviewer tip:** Search for `dynamic ` (with trailing space). Each occurrence should have a documented justification. If it's used to avoid creating a class, create the class instead.
+
+---
+
 ## Quick-Scan Reference Table
 
 | # | Rule | Grep / Search Pattern | Severity |
@@ -1129,6 +1260,8 @@ public class UserCache
 | 16 | No async void | `async void` | High |
 | 17 | Use throw; not throw ex; | `throw ex;` | Medium |
 | 18 | Concurrent collections for shared state | `static Dictionary<`, `static List<` with multi-thread access | High |
+| 19 | No Task.Run() in ASP.NET handlers | `Task.Run(`, `Task.Factory.StartNew(` in controllers | Medium |
+| 20 | Avoid dynamic keyword | `dynamic ` | Medium |
 
 ---
 
