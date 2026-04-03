@@ -19,6 +19,7 @@ Follow these rules when writing or modifying C# / .NET code in this project.
 - **Static collections must be bounded.** If using `static List<T>`, `static Dictionary<K,V>`, etc., ensure items are evicted. Prefer `IMemoryCache` with expiration.
 - **Use concurrent collections** (`ConcurrentDictionary`, `ConcurrentQueue`) when data is accessed from multiple threads. Regular `Dictionary`/`List` are not thread-safe.
 - **Connection strings must come from `IConfiguration`**, not hardcoded inline.
+- **Set `ThreadPool.SetMinThreads(200, 200)` for .NET 5+ on Linux.** Default thread pool ramp-up is too slow under burst load. Call before `WebApplication.CreateBuilder()` in `Program.cs`.
 
 ## Medium — Should Follow
 

@@ -100,6 +100,11 @@ You are a .NET code reviewer. Scan the current codebase for violations of the ru
 - Search: `dynamic `
 - Violation: Use of `dynamic` without justification. Must use strong types or generics.
 
+**Rule 21 — ThreadPool.SetMinThreads for .NET 5+ on Linux**
+- Search: `ThreadPool.SetMinThreads` in `Program.cs` or startup entry point
+- Violation: .NET 5+ project targeting Linux deployment without `ThreadPool.SetMinThreads(200, 200)` configured at startup. Default thread pool ramp-up on Linux is too slow and causes request queuing under burst load.
+- Note: Must be called **before** `WebApplication.CreateBuilder()`. Recommended minimum: 200 worker threads, 200 I/O threads.
+
 ### Configuration Check
 
 **Rule 8 — Visual Studio .gitignore**
