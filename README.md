@@ -28,6 +28,7 @@ A practical checklist for reviewing .NET / C# codebases. Each rule includes seve
 18. [Use Concurrent Collections for Shared State](#18-use-concurrent-collections-for-shared-state)
 19. [Avoid Task.Run() in ASP.NET Request Handlers](#19-avoid-taskrun-in-aspnet-request-handlers)
 20. [Avoid the dynamic Keyword](#20-avoid-the-dynamic-keyword)
+21. [Set ThreadPool.SetMinThreads for .NET 5+ on Linux](#21-set-threadpoolsetminthreads-for-net-5-on-linux)
 
 ---
 
@@ -1238,6 +1239,69 @@ public T GetValue<T>(string key)
 
 ---
 
+## 21. Set ThreadPool.SetMinThreads for .NET 5+ on Linux
+
+| Severity | Category | Search Pattern |
+|----------|----------|----------------|
+| **High** | Performance / Deployment | `ThreadPool.SetMinThreads` (must be present), check `Program.cs` or startup |
+
+**Why it matters:** On Linux, .NET 5+ uses a slower thread pool growth algorithm compared to Windows. Under sudden load (burst of incoming requests, many concurrent database calls), the default minimum thread count is too low — the thread pool takes **0.5–1 second per new thread** to ramp up. This causes **request queuing, timeouts, and cascading failures** in production. Setting `ThreadPool.SetMinThreads` to a higher value (recommended: **200**) ensures enough threads are available immediately when load spikes occur.
+
+### Bad Example — Default Thread Pool (No Configuration)
+
+```csharp
+// Program.cs — no thread pool configuration
+var builder = WebApplication.CreateBuilder(args);
+// ... default thread pool minimum is typically Environment.ProcessorCount
+// On a 4-core Linux container, only 4 threads are available initially
+// Under burst load: requests queue, timeouts cascade
+```
+
+### Good Example — Set MinThreads at Startup
+
+```csharp
+// Program.cs — set BEFORE building the host
+ThreadPool.SetMinThreads(200, 200); // 200 worker threads, 200 I/O completion threads
+
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddControllers();
+// ...
+var app = builder.Build();
+app.Run();
+```
+
+### Good Example — Configurable via appsettings.json
+
+```csharp
+// appsettings.json
+// {
+//   "ThreadPool": {
+//     "MinWorkerThreads": 200,
+//     "MinCompletionPortThreads": 200
+//   }
+// }
+
+// Program.cs
+var config = new ConfigurationBuilder()
+    .AddJsonFile("appsettings.json")
+    .Build();
+
+int minWorker = config.GetValue<int>("ThreadPool:MinWorkerThreads", 200);
+int minIO = config.GetValue<int>("ThreadPool:MinCompletionPortThreads", 200);
+ThreadPool.SetMinThreads(minWorker, minIO);
+
+var builder = WebApplication.CreateBuilder(args);
+// ...
+```
+
+> **Why 200?** It provides a buffer for most workloads. Tune based on your application's concurrency profile — monitor `ThreadPool.ThreadCount` and adjust. For high-throughput services, values of 300–500 may be appropriate.
+
+> **When does this apply?** .NET 5, .NET 6, .NET 7, .NET 8, and later — especially when deployed on **Linux containers** (Docker, Kubernetes, Azure App Service Linux). Windows deployments are less affected but still benefit from explicit configuration.
+
+**Reviewer tip:** Check `Program.cs` or the application entry point for `ThreadPool.SetMinThreads`. If deploying to Linux and it's missing, flag it. The call must happen **before** `WebApplication.CreateBuilder()` or `Host.CreateDefaultBuilder()`.
+
+---
+
 ## Quick-Scan Reference Table
 
 | # | Rule | Grep / Search Pattern | Severity |
@@ -1262,6 +1326,7 @@ public T GetValue<T>(string key)
 | 18 | Concurrent collections for shared state | `static Dictionary<`, `static List<` with multi-thread access | High |
 | 19 | No Task.Run() in ASP.NET handlers | `Task.Run(`, `Task.Factory.StartNew(` in controllers | Medium |
 | 20 | Avoid dynamic keyword | `dynamic ` | Medium |
+| 21 | ThreadPool.SetMinThreads on Linux | `ThreadPool.SetMinThreads` in `Program.cs` | High |
 
 ---
 
@@ -1279,3 +1344,4 @@ public T GetValue<T>(string key)
 - [ConcurrentDictionary](https://learn.microsoft.com/en-us/dotnet/api/system.collections.concurrent.concurrentdictionary-2)
 - [Safe Storage of Secrets](https://learn.microsoft.com/en-us/aspnet/core/security/app-secrets)
 - [StringBuilder Performance](https://learn.microsoft.com/en-us/dotnet/standard/base-types/stringbuilder)
+- [ThreadPool.SetMinThreads](https://learn.microsoft.com/en-us/dotnet/api/system.threading.threadpool.setminthreads)
