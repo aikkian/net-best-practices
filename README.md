@@ -29,6 +29,7 @@ A practical checklist for reviewing .NET / C# codebases. Each rule includes seve
 19. [Avoid Task.Run() in ASP.NET Request Handlers](#19-avoid-taskrun-in-aspnet-request-handlers)
 20. [Avoid the dynamic Keyword](#20-avoid-the-dynamic-keyword)
 21. [Set ThreadPool.SetMinThreads for .NET 5+ on Linux](#21-set-threadpoolsetminthreads-for-net-5-on-linux)
+22. [Avoid ConfigureAwait(false) and ConfigureAwait(true)](#22-avoid-configureawaitfalse-and-configureawaittrue)
 
 ---
 
@@ -1302,6 +1303,66 @@ var builder = WebApplication.CreateBuilder(args);
 
 ---
 
+## 22. Avoid ConfigureAwait(false) and ConfigureAwait(true)
+
+| Severity | Category | Search Pattern |
+|----------|----------|----------------|
+| **Medium** | Code Quality / Async | `ConfigureAwait(false)`, `ConfigureAwait(true)` |
+
+**Why it matters:** In **ASP.NET Core** and modern .NET (5+), there is **no `SynchronizationContext`**. This means `ConfigureAwait(false)` has no effect — the continuation already runs on any available thread pool thread. Adding it throughout application code is **unnecessary noise** that hurts readability with zero benefit. `ConfigureAwait(true)` is the default behavior, so it is always redundant.
+
+In older ASP.NET (Framework 4.x) and UI frameworks (WinForms/WPF), `ConfigureAwait(false)` was important in library code to avoid deadlocks. But in modern .NET application code, it should be avoided.
+
+### Bad Example — Unnecessary ConfigureAwait in ASP.NET Core
+
+```csharp
+public class OrderService
+{
+    private readonly IOrderRepository _repository;
+
+    public async Task<Order> GetOrderAsync(int id)
+    {
+        // unnecessary in ASP.NET Core — no SynchronizationContext exists
+        var order = await _repository.GetByIdAsync(id).ConfigureAwait(false);
+        var details = await _repository.GetDetailsAsync(id).ConfigureAwait(false);
+        return order;
+    }
+}
+```
+
+### Bad Example — Redundant ConfigureAwait(true)
+
+```csharp
+public async Task<List<Product>> GetProductsAsync()
+{
+    // ConfigureAwait(true) is the default — always redundant
+    var products = await _dbContext.Products.ToListAsync().ConfigureAwait(true);
+    return products;
+}
+```
+
+### Good Example — Clean Async Without ConfigureAwait
+
+```csharp
+public class OrderService
+{
+    private readonly IOrderRepository _repository;
+
+    public async Task<Order> GetOrderAsync(int id)
+    {
+        var order = await _repository.GetByIdAsync(id);
+        var details = await _repository.GetDetailsAsync(id);
+        return order;
+    }
+}
+```
+
+> **Exception — Shared Library Code:** If you are writing a **NuGet package or shared library** that may be consumed by WinForms, WPF, or legacy ASP.NET Framework applications, `ConfigureAwait(false)` is still recommended to prevent deadlocks in those contexts. This rule applies to **application code** only.
+
+**Reviewer tip:** Search for `ConfigureAwait(false)` and `ConfigureAwait(true)`. In ASP.NET Core or .NET 5+ application code, these should be removed. Only keep them in shared library projects that target multiple consumers.
+
+---
+
 ## Quick-Scan Reference Table
 
 | # | Rule | Grep / Search Pattern | Severity |
@@ -1327,6 +1388,7 @@ var builder = WebApplication.CreateBuilder(args);
 | 19 | No Task.Run() in ASP.NET handlers | `Task.Run(`, `Task.Factory.StartNew(` in controllers | Medium |
 | 20 | Avoid dynamic keyword | `dynamic ` | Medium |
 | 21 | ThreadPool.SetMinThreads on Linux | `ThreadPool.SetMinThreads` in `Program.cs` | High |
+| 22 | Avoid ConfigureAwait | `ConfigureAwait(false)`, `ConfigureAwait(true)` | Medium |
 
 ---
 
@@ -1345,3 +1407,4 @@ var builder = WebApplication.CreateBuilder(args);
 - [Safe Storage of Secrets](https://learn.microsoft.com/en-us/aspnet/core/security/app-secrets)
 - [StringBuilder Performance](https://learn.microsoft.com/en-us/dotnet/standard/base-types/stringbuilder)
 - [ThreadPool.SetMinThreads](https://learn.microsoft.com/en-us/dotnet/api/system.threading.threadpool.setminthreads)
+- [ConfigureAwait FAQ](https://devblogs.microsoft.com/dotnet/configureawait-faq/)

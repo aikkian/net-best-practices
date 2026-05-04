@@ -30,6 +30,7 @@ Follow these rules when writing or modifying C# / .NET code in this project.
 - **Use `throw;` not `throw ex;`** to preserve stack traces.
 - **Avoid `Task.Run()` in ASP.NET request handlers.** ASP.NET already runs on thread pool threads.
 - **Avoid the `dynamic` keyword.** Use strong types or generics instead.
+- **Avoid `ConfigureAwait(false)` and `ConfigureAwait(true)` in application code.** ASP.NET Core and .NET 5+ have no `SynchronizationContext`, making `ConfigureAwait` unnecessary noise. Only use in shared library code targeting legacy consumers.
 
 ## Configuration
 
