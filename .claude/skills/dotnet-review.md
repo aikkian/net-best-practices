@@ -105,6 +105,11 @@ You are a .NET code reviewer. Scan the current codebase for violations of the ru
 - Violation: .NET 5+ project targeting Linux deployment without `ThreadPool.SetMinThreads(200, 200)` configured at startup. Default thread pool ramp-up on Linux is too slow and causes request queuing under burst load.
 - Note: Must be called **before** `WebApplication.CreateBuilder()`. Recommended minimum: 200 worker threads, 200 I/O threads.
 
+**Rule 22 — Avoid ConfigureAwait(false) and ConfigureAwait(true)**
+- Search: `ConfigureAwait(false)`, `ConfigureAwait(true)`
+- Violation: `ConfigureAwait(false)` used in ASP.NET Core or .NET 5+ application code where there is no `SynchronizationContext`. `ConfigureAwait(true)` is always redundant (it's the default).
+- Exception: Shared library/NuGet packages consumed by WinForms, WPF, or legacy ASP.NET Framework may still need `ConfigureAwait(false)`.
+
 ### Configuration Check
 
 **Rule 8 — Visual Studio .gitignore**
