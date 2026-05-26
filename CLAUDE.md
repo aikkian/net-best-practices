@@ -13,7 +13,7 @@ Follow these rules when writing or modifying C# / .NET code in this project.
 - **All streams must be disposed.** Use `using var` or `using () { }` for `FileStream`, `MemoryStream`, `StreamReader`, `StreamWriter`, `NetworkStream`, etc.
 - **HttpClient must be singleton or static.** Never `new HttpClient()` per request. Use a `static readonly` field or `IHttpClientFactory`.
 - **Dispose all SQL objects.** `SqlConnection`, `SqlCommand`, `SqlDataReader`, and `SqlTransaction` must be wrapped in `using` statements.
-- **Redis, CosmosDB, Service Bus connections must be singleton.** Use `Lazy<T>` for thread-safe initialization or register as singleton in DI.
+- **Redis, CosmosDB, Service Bus connections must be singleton.** Use `Lazy<T>` for thread-safe initialization or register as singleton in DI. This includes `ConnectionMultiplexer` (Redis), `CosmosClient`, `ServiceBusClient`, `ServiceBusSender`, and `QueueClient` (legacy `Microsoft.Azure.ServiceBus` SDK) — never instantiate per request.
 - **No `async void`.** Return `async Task` instead. Only exception: UI event handlers (WinForms/WPF).
 - **Unsubscribe event handlers (`-=`)** when the subscriber is disposed. Dispose `Timer` objects.
 - **Static collections must be bounded.** If using `static List<T>`, `static Dictionary<K,V>`, etc., ensure items are evicted. Prefer `IMemoryCache` with expiration.

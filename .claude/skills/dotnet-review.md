@@ -47,8 +47,8 @@ You are a .NET code reviewer. Scan the current codebase for violations of the ru
 - Violation: `SqlConnection`, `SqlCommand`, `SqlDataReader`, or `SqlTransaction` created without `using` statement.
 
 **Rule 9 — Singleton + Lazy for Redis/CosmosDB/Service Bus**
-- Search: `ConnectionMultiplexer.Connect`, `new CosmosClient`, `new ServiceBusClient`, `new ServiceBusSender`
-- Violation: Connection created per request instead of as a singleton or `Lazy<T>`.
+- Search: `ConnectionMultiplexer.Connect`, `new CosmosClient`, `new ServiceBusClient`, `new ServiceBusSender`, `new QueueClient`
+- Violation: Connection or client created per request instead of as a singleton or `Lazy<T>`. Applies to `ConnectionMultiplexer` (Redis), `CosmosClient`, `ServiceBusClient`, `ServiceBusSender`, and `QueueClient` (legacy `Microsoft.Azure.ServiceBus` SDK) — all are expensive to initialize and must be reused.
 
 **Rule 11 — Static Collections (Memory Leak)**
 - Search: `static List<`, `static Dictionary<`, `static ArrayList`, `static HashSet<`, `static ConcurrentDictionary<`
