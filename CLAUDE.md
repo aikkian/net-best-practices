@@ -14,6 +14,7 @@ Follow these rules when writing or modifying C# / .NET code in this project.
 - **HttpClient must be singleton or static.** Never `new HttpClient()` per request. Use a `static readonly` field or `IHttpClientFactory`.
 - **Dispose all SQL objects.** `SqlConnection`, `SqlCommand`, `SqlDataReader`, and `SqlTransaction` must be wrapped in `using` statements.
 - **Redis, CosmosDB, Service Bus connections must be singleton.** Use `Lazy<T>` for thread-safe initialization or register as singleton in DI. This includes `ConnectionMultiplexer` (Redis), `CosmosClient`, `ServiceBusClient`, `ServiceBusSender`, and `QueueClient` (legacy `Microsoft.Azure.ServiceBus` SDK) — never instantiate per request.
+- **Datadog clients must be singleton.** Configure `DogStatsdService` (`DogStatsD-CSharp-Client`) once and register it as a singleton or `Lazy<T>` — never `new DogStatsdService()` per request (it owns a socket, batches metrics, and only flushes on `Dispose`). Ensure `Dispose()` runs on shutdown to flush buffered metrics. For tracing use `Tracer.Instance`; never `new Tracer()`.
 - **No `async void`.** Return `async Task` instead. Only exception: UI event handlers (WinForms/WPF).
 - **Unsubscribe event handlers (`-=`)** when the subscriber is disposed. Dispose `Timer` objects.
 - **Static collections must be bounded.** If using `static List<T>`, `static Dictionary<K,V>`, etc., ensure items are evicted. Prefer `IMemoryCache` with expiration.

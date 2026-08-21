@@ -1,6 +1,6 @@
 # .NET Code Review Checklist
 
-> **Last updated:** 2026-04-02
+> **Last updated:** 2026-08-21
 
 A practical checklist for reviewing .NET / C# codebases. Each rule includes severity, grep patterns for scanning, and bad/good code examples.
 
@@ -30,6 +30,7 @@ A practical checklist for reviewing .NET / C# codebases. Each rule includes seve
 20. [Avoid the dynamic Keyword](#20-avoid-the-dynamic-keyword)
 21. [Set ThreadPool.SetMinThreads for .NET 5+ on Linux](#21-set-threadpoolsetminthreads-for-net-5-on-linux)
 22. [Avoid ConfigureAwait(false) and ConfigureAwait(true)](#22-avoid-configureawaitfalse-and-configureawaittrue)
+23. [Datadog Client Must Be Singleton](#23-datadog-client-must-be-singleton)
 
 ---
 
@@ -1363,6 +1364,90 @@ public class OrderService
 
 ---
 
+## 23. Datadog Client Must Be Singleton
+
+| Severity | Category | Search Pattern |
+|----------|----------|----------------|
+| **High** | Resource Management / Observability | `new DogStatsdService(`, `.Configure(` (in a per-request path), `new StatsdConfig` |
+
+**Why it matters:** `DogStatsdService` (from the `DogStatsD-CSharp-Client` NuGet package) owns a UDP/UDS socket and an internal buffer that **batches many metrics into a single datagram**. It is designed to be configured **once** and reused for the lifetime of the process. Creating one per request opens a new socket every time, defeats batching (one datagram per metric), and — because metrics are flushed only on `Flush`/`Dispose` — silently drops data when short-lived instances are collected without disposal. Its send methods are non-blocking, so a single shared instance is safe to call from anywhere. The tracer (`Datadog.Trace`) is exposed through `Tracer.Instance`, which is **already a managed singleton** — never `new` your own.
+
+### Bad Example — DogStatsdService Per Call
+
+```csharp
+public class MetricsReporter
+{
+    public void RecordOrder(decimal amount)
+    {
+        // new socket per call; no batching; metrics may never flush before GC
+        var config = new StatsdConfig { StatsdServerName = "127.0.0.1", StatsdPort = 8125 };
+        var dog = new DogStatsdService();
+        dog.Configure(config);
+        dog.Increment("orders.count");
+        dog.Histogram("orders.amount", (double)amount);
+        // no Dispose() — buffered metrics are lost
+    }
+}
+```
+
+### Good Example — DI Singleton (Recommended)
+
+```csharp
+// Program.cs — configure once, register as singleton
+builder.Services.AddSingleton<IDogStatsd>(_ =>
+{
+    var config = new StatsdConfig
+    {
+        StatsdServerName = builder.Configuration["Datadog:AgentHost"] ?? "127.0.0.1",
+        StatsdPort = 8125,
+    };
+
+    var service = new DogStatsdService();
+    if (!service.Configure(config))
+        throw new InvalidOperationException("Cannot initialize DogStatsD.");
+    return service;
+});
+
+// In your service — inject via constructor
+public class MetricsReporter
+{
+    private readonly IDogStatsd _dog;
+
+    public MetricsReporter(IDogStatsd dog) => _dog = dog;
+
+    public void RecordOrder(decimal amount)
+    {
+        _dog.Increment("orders.count");
+        _dog.Histogram("orders.amount", (double)amount);
+    }
+}
+```
+
+> **Flush on shutdown:** `DogStatsdService` implements `IDisposable`. The DI container disposes singletons when the host shuts down, which flushes any buffered metrics. If you manage the instance yourself (e.g. a `static readonly` field or the static `DogStatsd` facade), call `Dispose()` / `DogStatsd.Dispose()` before the process exits so pending metrics are not lost.
+
+### Good Example — Lazy Singleton (No DI Container)
+
+```csharp
+public static class Metrics
+{
+    private static readonly Lazy<DogStatsdService> _lazy = new(() =>
+    {
+        var service = new DogStatsdService();
+        service.Configure(new StatsdConfig { StatsdServerName = "127.0.0.1", StatsdPort = 8125 });
+        return service;
+    });
+
+    public static IDogStatsd Instance => _lazy.Value;
+}
+
+// Tracing — Tracer.Instance is already a process-wide singleton; do not new your own.
+Tracer.Instance.ActiveScope?.Span.SetTag("order.id", orderId.ToString());
+```
+
+**Reviewer tip:** Search for `new DogStatsdService(` — it should appear exactly once, inside a singleton registration or `Lazy<T>` initializer, never inside a method invoked per request. Flag any `new Tracer(` (use `Tracer.Instance`) and confirm a `Dispose()` / `DogStatsd.Dispose()` exists on the shutdown path when the client is managed manually.
+
+---
+
 ## Quick-Scan Reference Table
 
 | # | Rule | Grep / Search Pattern | Severity |
@@ -1389,6 +1474,7 @@ public class OrderService
 | 20 | Avoid dynamic keyword | `dynamic ` | Medium |
 | 21 | ThreadPool.SetMinThreads on Linux | `ThreadPool.SetMinThreads` in `Program.cs` | High |
 | 22 | Avoid ConfigureAwait | `ConfigureAwait(false)`, `ConfigureAwait(true)` | Medium |
+| 23 | Datadog client singleton | `new DogStatsdService(`, `new Tracer(` | High |
 
 ---
 
@@ -1408,3 +1494,5 @@ public class OrderService
 - [StringBuilder Performance](https://learn.microsoft.com/en-us/dotnet/standard/base-types/stringbuilder)
 - [ThreadPool.SetMinThreads](https://learn.microsoft.com/en-us/dotnet/api/system.threading.threadpool.setminthreads)
 - [ConfigureAwait FAQ](https://devblogs.microsoft.com/dotnet/configureawait-faq/)
+- [DogStatsD C# Client](https://github.com/DataDog/dogstatsd-csharp-client)
+- [Datadog .NET Tracer](https://github.com/DataDog/dd-trace-dotnet)
